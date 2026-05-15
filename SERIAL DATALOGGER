@@ -1,0 +1,564 @@
+/*
+ * ESP32 E-Field Data Logger - Enhanced Version
+ * 
+ * Features:
+ * - Dual logging: SD Card + USB Serial
+ * - Correct voltage conversion: -20V to +20V range
+ * - Two-point calibration support
+ * - ADS1115 with GAIN_TWOTHIRDS (±6.144V range)
+ * - GPS integration
+ * - Automatic file rotation (60 seconds)
+ * - 20 Hz sampling rate
+ * 
+ * Signal Chain:
+ * Input: -20V to +20V
+ *   ↓ Bias Circuit (+20V)
+ * Biased: 0V to 40V
+ *   ↓ Voltage Divider (÷8)
+ * ADC Input: 0V to 5V
+ *   ↓ ADS1115 (16-bit)
+ * ADC Counts: 0 to 26,667
+ *   ↓ Conversion
+ * Output: -20V to +20V
+ * 
+ * Hardware:
+ * - ESP32 Development Board
+ * - ADS1115 16-bit ADC (I2C: GPIO21=SDA, GPIO22=SCL)
+ * - GPS Module (UART: GPIO16=RX, GPIO17=TX)
+ * - SD Card Module (SPI: GPIO5=CS)
+ * - Status LED (GPIO2)
+ * 
+ * Author: Enhanced for correct voltage range
+ * Version: 2.1
+ * Date: 2026-01-11
+ */
+
+#include <Wire.h>
+#include <Adafruit_ADS1X15.h>
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
+#include <SPI.h>
+#include <SD.h>
+
+// ══════════════════════════════════════════════════════════
+// PIN CONFIGURATION
+// ══════════════════════════════════════════════════════════
+#define I2C_SDA       21
+#define I2C_SCL       22
+#define GPS_RX        16
+#define GPS_TX        17
+#define SD_CS         5
+#define STATUS_LED    2  // Built-in LED
+
+// ══════════════════════════════════════════════════════════
+// TIMING CONFIGURATION
+// ══════════════════════════════════════════════════════════
+const uint32_t SAMPLE_INTERVAL_US = 5000;   // 5ms between ADC samples (200 Hz)
+const uint16_t SAMPLES_PER_POINT = 10;      // Average 10 samples = 50ms per point (20 Hz output)
+const uint32_t FILE_ROTATION_MS = 60000;    // Create new file every 60 seconds
+const uint16_t BUFFER_SIZE = 512;           // Circular buffer size (must be power of 2)
+const uint16_t WRITE_THRESHOLD = 100;       // Write to storage when buffer has this many points
+
+// ══════════════════════════════════════════════════════════
+// OUTPUT CONFIGURATION
+// ══════════════════════════════════════════════════════════
+const bool ENABLE_SD_LOGGING = true;        // Log to SD card
+const bool ENABLE_SERIAL_OUTPUT = true;     // Output to USB serial
+const uint32_t SERIAL_FLUSH_INTERVAL = 500; // Flush serial buffer every 500ms
+
+// ══════════════════════════════════════════════════════════
+// VOLTAGE CONVERSION CONSTANTS
+// ══════════════════════════════════════════════════════════
+// ADS1115 Configuration:
+// - Gain: GAIN_TWOTHIRDS (±6.144V full scale)
+// - Resolution: 16-bit signed
+// - LSB: 6.144V / 32768 = 0.0001875 V/count
+
+const float ADC_LSB = 0.0001875;            // Volts per count (GAIN_TWOTHIRDS)
+const float DIVIDER_RATIO = 8.0;            // Voltage divider: 10k / (70k + 10k) = 1/8
+const float BIAS_VOLTAGE = 20.0;            // DC bias added by transistor circuit (V)
+
+// Combined conversion constant: LSB × DIVIDER_RATIO
+const float ADC_TO_BIASED = ADC_LSB * DIVIDER_RATIO;  // 0.0015 V/count
+
+// ══════════════════════════════════════════════════════════
+// CALIBRATION CONSTANTS (Adjust after calibration)
+// ══════════════════════════════════════════════════════════
+// Two-Point Calibration Formula:
+// V_input = ((ADC_count × ADC_TO_BIASED) - BIAS_VOLTAGE) × CAL_GAIN + CAL_OFFSET
+//
+// To calibrate:
+// 1. Apply known voltage V1 (e.g., -10V), record ADC reading ADC1
+// 2. Apply known voltage V2 (e.g., +10V), record ADC reading ADC2
+// 3. Calculate:
+//    CAL_GAIN = (V2 - V1) / ((ADC2 - ADC1) × ADC_TO_BIASED)
+//    CAL_OFFSET = V1 - (((ADC1 × ADC_TO_BIASED) - BIAS_VOLTAGE) × CAL_GAIN)
+
+float CAL_GAIN = 1.0;      // Gain correction factor (1.0 = no correction)
+float CAL_OFFSET = 0.0;    // Offset correction (V) (0.0 = no correction)
+
+// ══════════════════════════════════════════════════════════
+// HARDWARE OBJECTS
+// ══════════════════════════════════════════════════════════
+Adafruit_ADS1115   ads;
+TinyGPSPlus        gps;
+HardwareSerial     gpsSerial(1);
+
+// ══════════════════════════════════════════════════════════
+// DATA STRUCTURES
+// ══════════════════════════════════════════════════════════
+struct DataPoint {
+  uint32_t timestampMs;
+  char     dateTime[20];      // YYYY-MM-DD HH:MM:SS
+  uint8_t  satellites;
+  int16_t  adcCount;          // Raw ADC count
+  float    adcVoltage;        // Voltage at ADC input (0-5V)
+  float    inputVoltage;      // Actual input voltage (-20V to +20V)
+  double   latitude;
+  double   longitude;
+};
+
+// ══════════════════════════════════════════════════════════
+// CIRCULAR BUFFER
+// ══════════════════════════════════════════════════════════
+class CircularBuffer {
+private:
+  DataPoint buffer[BUFFER_SIZE];
+  volatile uint16_t head = 0;
+  volatile uint16_t tail = 0;
+  volatile uint16_t count = 0;
+  
+public:
+  bool write(const DataPoint& data) {
+    uint16_t next = (head + 1) & (BUFFER_SIZE - 1);
+    if (next == tail) return false; // Buffer full
+    
+    buffer[head] = data;
+    head = next;
+    count++;
+    return true;
+  }
+  
+  bool read(DataPoint& data) {
+    if (head == tail) return false; // Buffer empty
+    
+    data = buffer[tail];
+    tail = (tail + 1) & (BUFFER_SIZE - 1);
+    count--;
+    return true;
+  }
+  
+  uint16_t available() const { return count; }
+  bool isFull() const { return ((head + 1) & (BUFFER_SIZE - 1)) == tail; }
+};
+
+// ══════════════════════════════════════════════════════════
+// GLOBAL VARIABLES
+// ══════════════════════════════════════════════════════════
+CircularBuffer dataBuffer;
+
+// SD Card state
+File currentFile;
+char currentFilename[64];
+uint32_t fileStartTime = 0;
+bool sdAvailable = false;
+uint32_t lastSerialFlush = 0;
+
+// ADC sampling
+int32_t adcAccumulator = 0;
+uint16_t sampleCount = 0;
+uint32_t lastSampleMicros = 0;
+
+// GPS state
+struct {
+  double latitude = 0.0;
+  double longitude = 0.0;
+  uint8_t satellites = 0;
+  bool isValid = false;
+  char dateTimeStr[20] = "NO_GPS";
+} gpsState;
+
+// Statistics
+struct {
+  uint32_t totalPoints = 0;
+  uint32_t droppedPoints = 0;
+  uint32_t filesCreated = 0;
+  uint32_t sdErrors = 0;
+  uint32_t serialOutputs = 0;
+  uint32_t lastReportTime = 0;
+} stats;
+
+// ══════════════════════════════════════════════════════════
+// VOLTAGE CONVERSION FUNCTIONS
+// ══════════════════════════════════════════════════════════
+
+/**
+ * Convert raw ADC count to voltage at ADC input (0-5V range)
+ */
+float adcCountToAdcVoltage(int16_t adcCount) {
+  return adcCount * ADC_LSB;
+}
+
+/**
+ * Convert raw ADC count to actual input voltage (-20V to +20V range)
+ * 
+ * Formula: V_input = ((ADC_count × ADC_TO_BIASED) - BIAS_VOLTAGE) × CAL_GAIN + CAL_OFFSET
+ * 
+ * Step 1: ADC count → ADC voltage (0-5V)
+ * Step 2: ADC voltage → Biased voltage (0-40V) [multiply by 8]
+ * Step 3: Biased voltage → Input voltage (-20V to +20V) [subtract 20V]
+ * Step 4: Apply calibration correction
+ */
+float adcCountToInputVoltage(int16_t adcCount) {
+  // Convert ADC count to biased voltage
+  float biasedVoltage = adcCount * ADC_TO_BIASED;
+  
+  // Remove bias to get input voltage
+  float inputVoltage = biasedVoltage - BIAS_VOLTAGE;
+  
+  // Apply calibration
+  float calibratedVoltage = (inputVoltage * CAL_GAIN) + CAL_OFFSET;
+  
+  return calibratedVoltage;
+}
+
+// ══════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ══════════════════════════════════════════════════════════
+
+void updateGpsState() {
+  while (gpsSerial.available() > 0) {
+    if (gps.encode(gpsSerial.read())) {
+      if (gps.location.isValid()) {
+        gpsState.latitude = gps.location.lat();
+        gpsState.longitude = gps.location.lng();
+        gpsState.isValid = true;
+      }
+      
+      if (gps.satellites.isValid()) {
+        gpsState.satellites = gps.satellites.value();
+      }
+      
+      if (gps.date.isValid() && gps.time.isValid()) {
+        snprintf(gpsState.dateTimeStr, sizeof(gpsState.dateTimeStr),
+                "%04d-%02d-%02d %02d:%02d:%02d",
+                gps.date.year(), gps.date.month(), gps.date.day(),
+                gps.time.hour(), gps.time.minute(), gps.time.second());
+      }
+    }
+  }
+}
+
+bool checkSDAvailable() {
+  static uint32_t lastCheck = 0;
+  if (millis() - lastCheck < 5000) return sdAvailable;
+  
+  lastCheck = millis();
+  uint64_t size = SD.cardSize();
+  sdAvailable = (size > 0);
+  return sdAvailable;
+}
+
+bool createNewFile() {
+  if (currentFile) {
+    currentFile.close();
+  }
+  
+  if (!checkSDAvailable()) {
+    return false;
+  }
+  
+  // Generate filename
+  if (gpsState.isValid && gps.date.isValid() && gps.time.isValid()) {
+    snprintf(currentFilename, sizeof(currentFilename),
+            "/EFM_%04d%02d%02d_%02d%02d%02d.csv",
+            gps.date.year(), gps.date.month(), gps.date.day(),
+            gps.time.hour(), gps.time.minute(), gps.time.second());
+  } else {
+    uint32_t seconds = millis() / 1000;
+    snprintf(currentFilename, sizeof(currentFilename),
+            "/EFM_NOGPS_%lu.csv", seconds);
+  }
+  
+  currentFile = SD.open(currentFilename, FILE_WRITE);
+  if (!currentFile) {
+    stats.sdErrors++;
+    sdAvailable = false;
+    return false;
+  }
+  
+  // Write CSV header
+  currentFile.println("Timestamp_ms,DateTime,Satellites,ADC_Count,ADC_Voltage_V,Input_Voltage_V,Latitude,Longitude");
+  currentFile.flush();
+  
+  // Announce new file to serial
+  if (ENABLE_SERIAL_OUTPUT) {
+    Serial.print("FILE_START:");
+    Serial.println(currentFilename);
+  }
+  
+  fileStartTime = millis();
+  stats.filesCreated++;
+  
+  return true;
+}
+
+void outputDataPoint(DataPoint& dp, bool toSD, bool toSerial) {
+  char line[200];
+  snprintf(line, sizeof(line), "%lu,%s,%u,%d,%.6f,%.6f,%.8f,%.8f",
+          dp.timestampMs, dp.dateTime, dp.satellites,
+          dp.adcCount, dp.adcVoltage, dp.inputVoltage,
+          dp.latitude, dp.longitude);
+  
+  // Write to SD card
+  if (toSD && checkSDAvailable() && currentFile) {
+    currentFile.print(line);
+    currentFile.print("\n");  // Single newline
+  }
+  
+  // Output to USB Serial
+  if (toSerial && ENABLE_SERIAL_OUTPUT) {
+    Serial.print("DATA:");
+    Serial.print(line);
+    Serial.print("\n");  // Single newline
+    stats.serialOutputs++;
+  }
+}
+
+void writeBufferToStorage() {
+  // Check if it's time to rotate file
+  if (currentFile && (millis() - fileStartTime > FILE_ROTATION_MS)) {
+    currentFile.close();
+    
+    if (ENABLE_SERIAL_OUTPUT) {
+      Serial.print("FILE_END:");
+      Serial.println(currentFilename);
+    }
+    
+    createNewFile();
+  }
+  
+  // Process data points
+  DataPoint dp;
+  uint16_t written = 0;
+  
+  while (dataBuffer.available() > 0 && written < WRITE_THRESHOLD) {
+    if (dataBuffer.read(dp)) {
+      outputDataPoint(dp, ENABLE_SD_LOGGING, ENABLE_SERIAL_OUTPUT);
+      written++;
+    }
+  }
+  
+  // Flush SD periodically
+  static uint32_t lastFlush = 0;
+  if (currentFile && (millis() - lastFlush > 2000)) {
+    currentFile.flush();
+    lastFlush = millis();
+    digitalWrite(STATUS_LED, !digitalRead(STATUS_LED));
+  }
+  
+  // Flush serial buffer
+  if (ENABLE_SERIAL_OUTPUT && (millis() - lastSerialFlush > SERIAL_FLUSH_INTERVAL)) {
+    Serial.flush();
+    lastSerialFlush = millis();
+  }
+}
+
+void printStatistics() {
+  if (millis() - stats.lastReportTime < 10000) return;
+  stats.lastReportTime = millis();
+  
+  float dataRate = (stats.totalPoints - stats.droppedPoints) / (millis() / 1000.0);
+  uint16_t bufferUsage = (dataBuffer.available() * 100) / BUFFER_SIZE;
+  
+  Serial.print("STATUS:");
+  Serial.printf("rate=%.2f,buffer=%u%%,total=%lu,dropped=%lu,sd=%s,serial=%lu\n",
+                dataRate, bufferUsage, stats.totalPoints, stats.droppedPoints,
+                sdAvailable ? "OK" : "ERR", stats.serialOutputs);
+}
+
+void printCalibrationInfo() {
+  Serial.println("\n╔════════════════════════════════════════════════╗");
+  Serial.println("║         CALIBRATION INFORMATION                ║");
+  Serial.println("╚════════════════════════════════════════════════╝");
+  Serial.println();
+  Serial.println("Current Calibration Constants:");
+  Serial.printf("  CAL_GAIN   = %.6f\n", CAL_GAIN);
+  Serial.printf("  CAL_OFFSET = %.6f V\n", CAL_OFFSET);
+  Serial.println();
+  Serial.println("Conversion Constants:");
+  Serial.printf("  ADC_LSB         = %.7f V/count\n", ADC_LSB);
+  Serial.printf("  DIVIDER_RATIO   = %.1f\n", DIVIDER_RATIO);
+  Serial.printf("  BIAS_VOLTAGE    = %.1f V\n", BIAS_VOLTAGE);
+  Serial.printf("  ADC_TO_BIASED   = %.6f V/count\n", ADC_TO_BIASED);
+  Serial.println();
+  Serial.println("Formula:");
+  Serial.println("  V_input = ((ADC × 0.0015) - 20.0) × CAL_GAIN + CAL_OFFSET");
+  Serial.println();
+  Serial.println("Expected ADC Readings:");
+  Serial.printf("  At -20.0V input: ADC ≈ 0\n");
+  Serial.printf("  At   0.0V input: ADC ≈ 13,333\n");
+  Serial.printf("  At +20.0V input: ADC ≈ 26,667\n");
+  Serial.println();
+  Serial.println("To Calibrate:");
+  Serial.println("  1. Apply -10V, note ADC reading (ADC1)");
+  Serial.println("  2. Apply +10V, note ADC reading (ADC2)");
+  Serial.println("  3. Calculate:");
+  Serial.println("     CAL_GAIN = 20.0 / ((ADC2 - ADC1) × 0.0015)");
+  Serial.println("     CAL_OFFSET = -10 - (((ADC1 × 0.0015) - 20) × CAL_GAIN)");
+  Serial.println("  4. Update constants in code and re-upload");
+  Serial.println();
+}
+
+// ══════════════════════════════════════════════════════════
+// SETUP
+// ══════════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  pinMode(STATUS_LED, OUTPUT);
+  digitalWrite(STATUS_LED, HIGH);
+  
+  // Wait for USB serial
+  delay(2000);
+  
+  Serial.println("\n╔════════════════════════════════════════════════╗");
+  Serial.println("║   ESP32 E-Field Data Logger v2.1 Enhanced     ║");
+  Serial.println("╚════════════════════════════════════════════════╝");
+  Serial.println();
+  Serial.println("DEVICE_ID:ESP32_EFM_001");
+  Serial.println("FIRMWARE:v2.1");
+  Serial.println("MODE:DUAL_LOG");
+  Serial.println("VOLTAGE_RANGE:-20V to +20V");
+  Serial.println();
+  
+  // Initialize I2C and ADS1115
+  Serial.println("Initializing ADS1115...");
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000);  // 400kHz I2C
+  
+  if (!ads.begin()) {
+    Serial.println("ERROR:ADS1115_NOT_FOUND");
+    Serial.println("Check I2C connections:");
+    Serial.println("  SDA → GPIO21");
+    Serial.println("  SCL → GPIO22");
+    while(1) { 
+      digitalWrite(STATUS_LED, !digitalRead(STATUS_LED));
+      delay(100);
+    }
+  }
+  
+  // Configure ADS1115 for 0-5V range
+  ads.setGain(GAIN_TWOTHIRDS);        // ±6.144V range (can handle 0-5V)
+  ads.setDataRate(RATE_ADS1115_860SPS); // 860 samples/second
+  
+  Serial.println("INIT:ADS1115_OK");
+  Serial.println("  Gain: GAIN_TWOTHIRDS (±6.144V)");
+  Serial.println("  Data Rate: 860 SPS");
+  Serial.println("  LSB: 0.0001875 V/count");
+  
+  // Initialize GPS
+  Serial.println();
+  Serial.println("Initializing GPS...");
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  gpsSerial.setRxBufferSize(1024);
+  Serial.println("INIT:GPS_OK");
+  Serial.println("  Baud: 9600");
+  Serial.println("  RX → GPIO16, TX → GPIO17");
+  
+  // Initialize SD Card
+  Serial.println();
+  Serial.println("Initializing SD Card...");
+  if (SD.begin(SD_CS, SPI, 10000000)) {
+    sdAvailable = true;
+    uint8_t cardType = SD.cardType();
+    uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+    Serial.printf("INIT:SD_OK,type=%d,size=%llu MB\n", cardType, cardSize);
+    createNewFile();
+  } else {
+    sdAvailable = false;
+    Serial.println("INIT:SD_FAILED");
+    Serial.println("WARNING:SERIAL_OUTPUT_ONLY");
+  }
+  
+  // Print calibration info
+  printCalibrationInfo();
+  
+  lastSampleMicros = micros();
+  digitalWrite(STATUS_LED, LOW);
+  
+  Serial.println("╔════════════════════════════════════════════════╗");
+  Serial.println("║              SYSTEM READY                      ║");
+  Serial.println("╚════════════════════════════════════════════════╝");
+  Serial.println();
+  
+  // Output CSV header for serial capture
+  if (ENABLE_SERIAL_OUTPUT) {
+    Serial.println("HEADER:Timestamp_ms,DateTime,Satellites,ADC_Count,ADC_Voltage_V,Input_Voltage_V,Latitude,Longitude");
+  }
+}
+
+// ══════════════════════════════════════════════════════════
+// MAIN LOOP
+// ══════════════════════════════════════════════════════════
+void loop() {
+  static uint32_t lastWriteTime = 0;
+  
+  // Process GPS data
+  updateGpsState();
+  
+  // ADC sampling at precise 5ms intervals (200 Hz)
+  uint32_t currentMicros = micros();
+  if (currentMicros - lastSampleMicros >= SAMPLE_INTERVAL_US) {
+    lastSampleMicros = currentMicros;
+    
+    // Read ADC
+    int16_t adcValue = ads.readADC_SingleEnded(0);
+    adcAccumulator += adcValue;
+    sampleCount++;
+    
+    // Create data point every 10 samples (50ms = 20 Hz output)
+    if (sampleCount >= SAMPLES_PER_POINT) {
+      // Calculate average ADC count
+      int16_t avgAdc = adcAccumulator / sampleCount;
+      
+      // Convert to voltages
+      float adcVoltage = adcCountToAdcVoltage(avgAdc);
+      float inputVoltage = adcCountToInputVoltage(avgAdc);
+      
+      // Create data point
+      DataPoint dp;
+      dp.timestampMs = millis();
+      strncpy(dp.dateTime, gpsState.dateTimeStr, sizeof(dp.dateTime));
+      dp.satellites = gpsState.satellites;
+      dp.adcCount = avgAdc;
+      dp.adcVoltage = adcVoltage;
+      dp.inputVoltage = inputVoltage;
+      dp.latitude = gpsState.latitude;
+      dp.longitude = gpsState.longitude;
+      
+      // Add to buffer
+      if (!dataBuffer.write(dp)) {
+        stats.droppedPoints++;
+        Serial.println("WARNING:Buffer full, data point dropped!");
+      }
+      
+      stats.totalPoints++;
+      
+      // Reset accumulators
+      adcAccumulator = 0;
+      sampleCount = 0;
+    }
+  }
+  
+  // Write to storage
+  if (dataBuffer.available() >= WRITE_THRESHOLD || 
+      (millis() - lastWriteTime > 2000 && dataBuffer.available() > 0)) {
+    writeBufferToStorage();
+    lastWriteTime = millis();
+  }
+  
+  // Print statistics
+  printStatistics();
+  
+  yield();
+}
