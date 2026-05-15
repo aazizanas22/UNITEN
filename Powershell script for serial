@@ -1,0 +1,168 @@
+# ========================================
+# ESP32 EFM Data Auto-Capture Script
+# ========================================
+
+param(
+    [string]$ComPort = "COM3",  # ← CHANGE THIS TO YOUR COM PORT!
+    [string]$OutputDir = "C:\EFM_Data",
+    [string]$DeviceId = "ESP32_EFM_001"
+)
+
+Write-Host "======================================" -ForegroundColor Cyan
+Write-Host "  ESP32 EFM Auto-Capture Started" -ForegroundColor Cyan
+Write-Host "======================================" -ForegroundColor Cyan
+Write-Host ""
+
+# Create output directory structure
+$dateDir = Join-Path $OutputDir "$DeviceId\$(Get-Date -Format 'yyyy-MM-dd')"
+try {
+    New-Item -ItemType Directory -Force -Path $dateDir | Out-Null
+    Write-Host "[OK] Output directory created: $dateDir" -ForegroundColor Green
+} catch {
+    Write-Host "[ERROR] Could not create directory: $_" -ForegroundColor Red
+    exit 1
+}
+
+# Generate filename with timestamp
+$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$logFile = Join-Path $dateDir "EFM_$timestamp.csv"
+
+Write-Host "[OK] Log file: $logFile" -ForegroundColor Green
+Write-Host ""
+
+# Try to open serial port
+Write-Host "Connecting to $ComPort..." -ForegroundColor Yellow
+
+try {
+    $port = New-Object System.IO.Ports.SerialPort $ComPort, 115200, None, 8, One
+    $port.ReadTimeout = 3000
+    $port.Open()
+    Write-Host "[OK] Connected to $ComPort" -ForegroundColor Green
+} catch {
+    Write-Host "[ERROR] Could not open $ComPort" -ForegroundColor Red
+    Write-Host "Make sure:" -ForegroundColor Yellow
+    Write-Host "  1. ESP32 is plugged in" -ForegroundColor Yellow
+    Write-Host "  2. COM port is correct (check Device Manager)" -ForegroundColor Yellow
+    Write-Host "  3. No other program is using the port" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Error details: $_" -ForegroundColor Red
+    Read-Host "Press Enter to exit"
+    exit 1
+}
+
+# Create file writer
+$writer = New-Object System.IO.StreamWriter($logFile, $true)
+$writer.AutoFlush = $true
+$headerWritten = $false
+$lineCount = 0
+$lastStatusTime = Get-Date
+
+Write-Host ""
+Write-Host "======================================" -ForegroundColor Green
+Write-Host "  LOGGING ACTIVE" -ForegroundColor Green
+Write-Host "======================================" -ForegroundColor Green
+Write-Host "Press Ctrl+C to stop" -ForegroundColor Yellow
+Write-Host ""
+
+try {
+    while ($true) {
+        try {
+            $line = $port.ReadLine()
+            
+            # Write header
+            if ($line -match "^HEADER:(.*)") {
+                if (-not $headerWritten) {
+                    $writer.WriteLine($matches[1])
+                    Write-Host "[HEADER] $($matches[1])" -ForegroundColor Cyan
+                    $headerWritten = $true
+                }
+            }
+            # Write data
+            elseif ($line -match "^DATA:(.*)") {
+                $writer.WriteLine($matches[1])
+                $lineCount++
+                
+                # Show progress every 10 lines
+                if ($lineCount % 10 -eq 0) {
+                    Write-Host "." -NoNewline -ForegroundColor Green
+                }
+                
+                # Show count every 100 lines
+                if ($lineCount % 100 -eq 0) {
+                    Write-Host " $lineCount lines" -ForegroundColor Green
+                }
+            }
+            # Log device status
+            elseif ($line -match "^STATUS:(.*)") {
+                $now = Get-Date
+                if (($now - $lastStatusTime).TotalSeconds -ge 10) {
+                    Write-Host ""
+                    Write-Host "[STATUS] $($matches[1])" -ForegroundColor Yellow
+                    Write-Host "[INFO] Lines captured: $lineCount" -ForegroundColor Cyan
+                    $lastStatusTime = $now
+                }
+            }
+            # New file notification
+            elseif ($line -match "^FILE_START:(.*)") {
+                Write-Host ""
+                Write-Host "[FILE] ESP32 started new file: $($matches[1])" -ForegroundColor Magenta
+            }
+            # Ready signal
+            elseif ($line -match "^READY") {
+                Write-Host "[READY] ESP32 is ready and logging" -ForegroundColor Green
+            }
+            # Initialization messages
+            elseif ($line -match "^INIT:") {
+                Write-Host "[INIT] $line" -ForegroundColor Cyan
+            }
+            # Device ID
+            elseif ($line -match "^DEVICE_ID:") {
+                Write-Host "[INFO] $line" -ForegroundColor Cyan
+            }
+        } catch [System.TimeoutException] {
+            # Timeout is normal, just continue
+            continue
+        } catch {
+            Write-Host ""
+            Write-Host "[WARNING] Read error: $_" -ForegroundColor Yellow
+            Start-Sleep -Seconds 1
+        }
+        
+        # Check if we need to rotate to a new day
+        $currentDateDir = Join-Path $OutputDir "$DeviceId\$(Get-Date -Format 'yyyy-MM-dd')"
+        if ($currentDateDir -ne $dateDir) {
+            Write-Host ""
+            Write-Host "[INFO] New day - rotating to new file" -ForegroundColor Cyan
+            $writer.Close()
+            
+            $dateDir = $currentDateDir
+            New-Item -ItemType Directory -Force -Path $dateDir | Out-Null
+            
+            $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+            $logFile = Join-Path $dateDir "EFM_$timestamp.csv"
+            
+            $writer = New-Object System.IO.StreamWriter($logFile, $true)
+            $writer.AutoFlush = $true
+            $headerWritten = $false
+            $lineCount = 0
+            
+            Write-Host "[INFO] New file: $logFile" -ForegroundColor Green
+        }
+    }
+}
+finally {
+    Write-Host ""
+    Write-Host ""
+    Write-Host "======================================" -ForegroundColor Cyan
+    Write-Host "  Capture Stopped" -ForegroundColor Cyan
+    Write-Host "======================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Total lines captured: $lineCount" -ForegroundColor Green
+    Write-Host "Data saved to: $logFile" -ForegroundColor Green
+    Write-Host ""
+    
+    if ($writer) { $writer.Close() }
+    if ($port -and $port.IsOpen) { $port.Close() }
+    
+    Read-Host "Press Enter to exit"
+}
