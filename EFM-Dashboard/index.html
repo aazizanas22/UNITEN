@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>EFM-100 Cloud Replica</title>
+
+<link rel="stylesheet" href="css/style.css">
+
+<!-- Firebase -->
+<script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
+
+<!-- Chart -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
+
+</head>
+
+<body>
+
+<div class="window">
+
+    <!-- TOP BAR -->
+    <div class="topbar">
+        <div class="location">Location: KAJANG</div>
+        <div class="settings-btn" onclick="openSettings()">⚙ Settings</div>
+    </div>
+
+    <!-- MAIN DISPLAY AREA -->
+    <div class="main">
+
+        <!-- GRAPH -->
+        <div class="graph-container">
+            <canvas id="chart"></canvas>
+        </div>
+
+        <!-- LIGHTNING RINGS -->
+        <div class="rings-container">
+            <svg width="260" height="260">
+                <circle id="outerRing" cx="130" cy="130" r="120" fill="#00ff00"/>
+                <circle cx="130" cy="130" r="90" fill="none" stroke="#000" stroke-width="2"/>
+                <circle cx="130" cy="130" r="60" fill="none" stroke="#000" stroke-width="2"/>
+                <circle cx="130" cy="130" r="30" fill="none" stroke="#000" stroke-width="2"/>
+
+                <text x="130" y="30" text-anchor="middle">24</text>
+                <text x="130" y="60" text-anchor="middle">18</text>
+                <text x="130" y="90" text-anchor="middle">12</text>
+                <text x="130" y="120" text-anchor="middle">6</text>
+            </svg>
+         <text id="unitLabel" x="100" y="190" fill="#888">Miles</text>
+        </div>
+
+    </div>
+
+    <!-- BOTTOM CONTROLS -->
+    <div class="bottom">
+
+        <div class="alarm" id="alarmBox">Normal</div>
+
+        <div class="control">
+            Amplitude<br>
+            <select id="ampSelect">
+                <option value="0.5">0.5</option>
+                <option value="1">1</option>
+                <option value="2">2</option>
+                <option value="5" selected>5</option>
+                <option value="7.5">7.5</option>
+                <option value="10">10</option>
+                <option value="15">15</option>
+                <option value="20">20</option>
+            </select>
+        </div>
+
+        <div class="control">
+            Time Range<br>
+            <select id="timeSelect">
+                <option value="300">5 min</option>
+                <option value="900">15 min</option>
+                <option value="1800">30 min</option>
+                <option value="3600">1 hour</option>
+                <option value="7200">2 hour</option>
+                <option value="14400">4 hour</option>
+                <option value="28800">8 hour</option>
+                <option value="86400">24 hour</option>
+            </select>
+        </div>
+
+        <div class="digital" id="digitalValue">0.00</div>
+
+    </div>
+
+</div>
+
+<!-- ================= SETTINGS MODAL ================= -->
+
+<div id="settingsModal" class="modal">
+
+    <div class="modal-content">
+
+        <h2>Configuration</h2>
+
+        <label>Units:</label>
+        <select id="unitSelect">
+            <option value="miles">Miles</option>
+            <option value="km">KM</option>
+        </select>
+
+        <label>High Field Setpoint:</label>
+        <input type="number" id="highInput" step="0.1">
+
+        <label>Very High Field Setpoint:</label>
+        <input type="number" id="veryHighInput" step="0.1">
+
+        <label>Lightning Delta Threshold:</label>
+        <input type="number" id="deltaInput" step="0.1">
+
+        <button onclick="saveSettings()">Save</button>
+        <button onclick="closeSettings()">Close</button>
+
+    </div>
+
+</div>
+
+<!-- ================= JS FILES ================= -->
+
+<script src="js/chart.js"></script>
+<script src="js/alarms.js"></script>
+<script src="js/processing.js"></script>
+<script src="js/settings.js"></script>
+<script src="js/firebase.js"></script>
+</body>
+</html>

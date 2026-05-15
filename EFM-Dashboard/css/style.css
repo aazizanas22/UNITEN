@@ -1,0 +1,130 @@
+body{
+    margin:0;
+    background:#000;
+    font-family:Tahoma;
+    color:white;
+}
+
+.window{
+    width:1200px;
+    margin:20px auto;
+}
+
+.topbar{
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    margin-bottom:5px;
+}
+
+.location{
+    color:cyan;
+    font-size:14px;
+}
+
+.settings-btn{
+    cursor:pointer;
+    color:#0ff;
+    font-size:14px;
+}
+
+.main{
+    display:grid;
+    grid-template-columns:3fr 1fr;
+    height:520px;
+}
+
+.graph-container{
+    background:#000;
+}
+
+canvas{
+    background:#000;
+}
+
+.rings-container{
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+}
+
+.ring-label{
+    color:#0f0;
+    margin-top:5px;
+}
+
+.bottom{
+    display:flex;
+    align-items:center;
+    margin-top:15px;
+}
+
+.alarm{
+    width:320px;
+    height:45px;
+    display:flex;
+    align-items:center;
+    padding-left:15px;
+    font-weight:bold;
+    background:#00aa00;
+    color:black;
+}
+
+.control{
+    margin-left:30px;
+}
+
+.control select{
+    background:#000;
+    color:white;
+    border:1px solid #555;
+}
+
+.digital{
+    margin-left:auto;
+    font-size:150px;
+    font-family:Courier New;
+    color:#00ff00;
+}
+
+/* ================= MODAL ================= */
+
+.modal{
+    display:none;
+    position:fixed;
+    top:0;
+    left:0;
+    width:100%;
+    height:100%;
+    background:rgba(0,0,0,0.7);
+    justify-content:center;
+    align-items:center;
+}
+
+.modal-content{
+    background:#111;
+    padding:20px;
+    width:300px;
+    color:white;
+    display:flex;
+    flex-direction:column;
+    gap:10px;
+    border:1px solid #444;
+}
+
+.modal-content input,
+.modal-content select{
+    background:black;
+    color:white;
+    border:1px solid #555;
+    padding:5px;
+}
+
+.modal-content button{
+    background:#222;
+    color:white;
+    border:1px solid #555;
+    padding:5px;
+    cursor:pointer;
+}
