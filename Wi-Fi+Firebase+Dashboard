@@ -1,0 +1,150 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include <Adafruit_ADS1X15.h>
+
+// ===== WIFI =====
+const char* ssid = "NOTJALAK_2.4GHz";
+const char* password = "MAA040404";
+const char* firebaseURL =
+"https://fyp1-cc06a-default-rtdb.asia-southeast1.firebasedatabase.app/SSSS.json";
+
+// ===== TEST SETTINGS =====
+const uint32_t SAMPLE_INTERVAL_US = 50000;   // 50ms = 20Hz
+const uint32_t TEST_DURATION_MS   = 300000;  // 300000=5min | 60000=1min | 600000=10min
+const uint8_t  BATCH_SIZE = 80;              // 4 seconds per POST (20Hz × 4)
+
+// ===== ADC =====
+Adafruit_ADS1115 ads;
+
+// ===== Timing =====
+uint32_t lastSampleMicros = 0;
+uint32_t testStartMillis = 0;
+
+// ===== Counters =====
+uint32_t totalSamples = 0;
+uint32_t successfulPosts = 0;
+
+bool finished = false;
+
+// ===== Batch Structure =====
+struct Sample {
+  uint32_t t;
+  int16_t adc;
+  float v;
+};
+
+Sample batch[BATCH_SIZE];
+uint8_t batchIndex = 0;
+
+// =====================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  // WiFi connect
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Connected!");
+
+  // ADC init
+  Wire.begin();
+  ads.begin();
+  ads.setGain(GAIN_ONE);
+  ads.setDataRate(RATE_ADS1115_860SPS);
+
+  testStartMillis = millis();
+  lastSampleMicros = micros();
+
+  Serial.println("Starting WiFi Batch Test...");
+}
+
+// =====================================================
+
+void loop() {
+
+  if (finished) return;
+
+  uint32_t nowMicros = micros();
+
+  // -------- 20 Hz Sampling --------
+  if (nowMicros - lastSampleMicros >= SAMPLE_INTERVAL_US) {
+
+    lastSampleMicros += SAMPLE_INTERVAL_US;
+
+    int16_t adc = ads.readADC_SingleEnded(0);
+    float voltage = adc * 0.000125;
+
+    batch[batchIndex++] = { millis(), adc, voltage };
+    totalSamples++;
+
+    if (batchIndex >= BATCH_SIZE) {
+      sendBatch(batchIndex);
+      batchIndex = 0;
+    }
+  }
+
+  // -------- End Test --------
+  if (millis() - testStartMillis >= TEST_DURATION_MS) {
+
+    // Send remaining samples
+    if (batchIndex > 0) {
+      sendBatch(batchIndex);
+      batchIndex = 0;
+    }
+
+    finished = true;
+
+    float durationSec = (millis() - testStartMillis) / 1000.0;
+    float effectiveRate = totalSamples / durationSec;
+
+    Serial.println("\n===== WIFI TEST COMPLETE =====");
+    Serial.print("Duration (s): ");
+    Serial.println(durationSec);
+    Serial.print("Total Samples: ");
+    Serial.println(totalSamples);
+    Serial.print("Successful Posts: ");
+    Serial.println(successfulPosts);
+    Serial.print("Effective Rate: ");
+    Serial.print(effectiveRate);
+    Serial.println(" Hz");
+  }
+}
+
+// =====================================================
+
+void sendBatch(uint8_t count) {
+
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  http.begin(firebaseURL);
+  http.addHeader("Content-Type", "application/json");
+
+  String json = "{ \"batch\": [";
+
+  for (int i = 0; i < count; i++) {
+    json += "{";
+    json += "\"t\":" + String(batch[i].t) + ",";
+    json += "\"a\":" + String(batch[i].adc) + ",";
+    json += "\"v\":" + String(batch[i].v, 6);
+    json += "}";
+
+    if (i < count - 1) json += ",";
+  }
+
+  json += "]}";
+
+  int code = http.POST(json);
+
+  if (code > 0 && code < 400) {
+    successfulPosts++;
+  }
+
+  http.end();
+}
