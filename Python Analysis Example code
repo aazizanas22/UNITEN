@@ -1,0 +1,58 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+from tkinter import Tk
+from tkinter.filedialog import askopenfilename
+
+Tk().withdraw()
+
+print("Select SERIAL 10-min CSV file")
+serial_file = askopenfilename(filetypes=[("CSV Files", "*.csv")])
+
+print("Select WIFI 10-min CSV file")
+wifi_file = askopenfilename(filetypes=[("CSV Files", "*.csv")])
+
+# =========================
+# SERIAL NOISE
+# =========================
+df_serial = pd.read_csv(serial_file, header=None)
+
+# Column 4 = Voltage
+df_serial[4] = pd.to_numeric(df_serial[4], errors='coerce')
+df_serial = df_serial.dropna(subset=[4])
+
+serial_noise = df_serial[4].std()
+serial_noise_mv = serial_noise * 1000  # convert to mV
+
+# =========================
+# WIFI NOISE
+# =========================
+df_wifi = pd.read_csv(wifi_file)
+
+df_wifi["Voltage_V"] = pd.to_numeric(df_wifi["Voltage_V"], errors='coerce')
+df_wifi = df_wifi.dropna(subset=["Voltage_V"])
+
+wifi_noise = df_wifi["Voltage_V"].std()
+wifi_noise_mv = wifi_noise * 1000  # convert to mV
+
+# =========================
+# PRINT RESULTS
+# =========================
+print("\n===== ADC NOISE COMPARISON (10 MIN) =====")
+print("Serial Voltage Noise: {:.6f} V ({:.3f} mV)".format(serial_noise, serial_noise_mv))
+print("WiFi Voltage Noise: {:.6f} V ({:.3f} mV)".format(wifi_noise, wifi_noise_mv))
+
+noise_change = ((wifi_noise - serial_noise) / serial_noise) * 100
+print("Noise Change (WiFi vs Serial): {:.2f}%".format(noise_change))
+
+# =========================
+# BAR GRAPH
+# =========================
+labels = ["Serial", "WiFi"]
+values = [serial_noise_mv, wifi_noise_mv]
+
+plt.figure(figsize=(6,4))
+plt.bar(labels, values)
+plt.title("ADC Voltage Noise Comparison (10 Minutes)")
+plt.ylabel("Voltage Std (mV)")
+plt.grid(axis='y')
+plt.show()
